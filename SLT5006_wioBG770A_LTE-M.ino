@@ -26,12 +26,17 @@ static JsonDocument JsonDoc;
 char SoilData[100];                                             //土壌センサ用データ取得配列
 int SoilDataLength;                                             //土壌センサ用データ長
 float TEMP, EC_BULK, VWC_ROCK, VWC, VWC_COCO, EC_PORE = { 0 };  //土壌センサ測定値変数
+float BATT, VSYS;                                               //電圧
+int bcs, bcl, bv = { 0 };                                       //システム電圧
+int CHARGE;                                                     //バッテリー
+
 
 //タイムスタンプ関連宣言
-time_t currentTime;               //現在時刻のUNIX時間(秒で取得)
-unsigned long lastRtcUpdate = 0;  // 最後に RTC を更新した時間
-char iso8601[25];                 //ISO8601タイムスタンプ用
-int diff;                         //UTCとの時差格納用
+time_t currentTime;                   //現在時刻のUNIX時間(秒で取得)
+unsigned long lastRtcUpdate = 0;      // 最後に RTC を更新した時間
+char iso8601[25];                     //ISO8601タイムスタンプ用
+int diff;                             //UTCとの時差格納用
+static time_t lastRtcUpdateUnix = 0;  // 前回RTC更新したUNIX時間
 
 //セルラー通信設定
 #define SEARCH_ACCESS_TECHNOLOGY (WioCellularNetwork::SearchAccessTechnology::LTEM)  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
@@ -41,11 +46,11 @@ static const char HOST[] = "uni.soracom.io";  //Unified endpoint
 static constexpr int PORT = 23080;
 
 //各種時間設定
-static constexpr int INTERVAL = 1000 * 60 * 5;             // 測定インターバル[ms]
-const unsigned long RTC_UPDATE_INTERVAL = 1000 * 60 * 60;  // RTC更新インターバル(1時間)[ms]
-static constexpr int POWER_ON_TIMEOUT = 1000 * 20;         // 電源タイムアプト時間[ms]
-static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 2;      // ネットワークタイムアウト時間[ms]
-static constexpr int RECEIVE_TIMEOUT = 1000 * 10;          // 受信タイムアウト時間[ms]
+static constexpr int INTERVAL = 1000 * 60 * 5;  // 測定インターバル[ms]
+//const unsigned long RTC_UPDATE_INTERVAL = 1000 * 60 * 60;  // RTC更新インターバル(1時間)[ms]
+static constexpr int POWER_ON_TIMEOUT = 1000 * 20;     // 電源タイムアプト時間[ms]
+static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 2;  // ネットワークタイムアウト時間[ms]
+static constexpr int RECEIVE_TIMEOUT = 1000 * 10;      // 受信タイムアウト時間[ms]
 
 //HTTPレスポンスの構造体
 struct HttpResponse {
@@ -70,12 +75,18 @@ public:
   }
   bool read(float &TEMP, float &EC_BULK, float &VWC_ROCK, float &VWC, float &VWC_COCO, float &EC_PORE) {
     int flag = 0;
-    while (flag == 0) {
+    int retry = 0;
+    while (flag == 0 && retry < 10) {
       uint8_t txData2[] = { 0x01, 0x08, 0x01, 0x00, 0xE6 };
       Serial1.write(txData2, sizeof(txData2));
       delay(50);
       receiveData2(&flag);
       delay(500);
+      retry++;
+    }
+    if (flag == 0) {
+      Serial.println("Sensor read timeout");
+      return false;  //センサ応答無限ループ回避
     }
 
     uint8_t txData3[] = { 0x01, 0x13, 0x10, 0xFC, 0x2C };  //SLT5006用測定データ読出しコマンド
@@ -148,18 +159,25 @@ private:
 // JSON生成用モジュール ※出力項目に応じて要変更
 class JsonModule {
 public:
-  void createJson(JsonDocument &doc, float TEMP, float EC_BULK, float VWC_ROCK, float VWC, float VWC_COCO, float EC_PORE, time_t rawTime) {
+  void createJson(JsonDocument &doc, float TEMP, float EC_BULK, float VWC_ROCK, float VWC, float VWC_COCO, float EC_PORE, float BATT, float VSYS, int CHRAGE, time_t rawTime) {
     struct tm *jstTime = gmtime(&rawTime);  //UNIX時間(time_t型)を日本時間のtm構造体に変換
     char iso8601[25];                       //ISO8601形式の配列
     strftime(iso8601, sizeof(iso8601), "%Y-%m-%dT%H:%M:%S", jstTime);
 
     doc["sample_time"] = iso8601;
-    doc["TEMP"] = TEMP;
-    doc["EC_BULK"] = EC_BULK;
-    doc["VWC_ROCK"] = VWC_ROCK;
-    doc["VWC"] = VWC;
-    doc["VWC_COCO"] = VWC_COCO;
-    doc["EC_PORE"] = EC_PORE;
+    doc["TEMP"] = formatFloat(TEMP, 1);
+    doc["EC_BULK"] = formatFloat(EC_BULK, 1);
+    doc["VWC_ROCK"] = formatFloat(VWC_ROCK, 1);
+    doc["VWC"] = formatFloat(VWC, 1);
+    doc["VWC_COCO"] = formatFloat(VWC_COCO, 1);
+    doc["EC_PORE"] = formatFloat(EC_PORE, 1);
+    doc["BATT"] = formatFloat(BATT, 1);  //バッテリー電圧
+    doc["VSYS"] = formatFloat(VSYS, 1);  //システム電圧
+    doc["CHARGE"] = CHARGE;              //バッテリー残量
+  }
+private:
+  String formatFloat(float value, uint8_t digits) {
+    return String(value, digits);  // 小数点以下桁数で文字列に変換
   }
 };
 
@@ -176,25 +194,29 @@ void setup() {
     }
   }
 
-  //USBDevice.detach();   // *********デバッグ時ON*********USB CDC シリアル通信を切断
+  //USBDevice.detach();   // *********デバッグ時コメントアウト*********USB CDC シリアル通信を切断
 
   Serial.println();
 
-  Serial.print("Startup");          //セルラー通信の開始
+  Serial.println("Startup");        //セルラー通信の開始
   digitalWrite(LED_BUILTIN, HIGH);  //LED ON
 
   WioCellular.begin();
-  if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) abort();
+  if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) NVIC_SystemReset();
+
+  digitalWrite(PIN_VGROVE_ENABLE, LOW);  //Grove電源ON
+  Serial1.begin(9600);                   // UARTの通信ボーレート設定
+  delay(500);
+  digitalWrite(PIN_VGROVE_ENABLE, HIGH);  //Grove電源OFF
 
   WioNetwork.config.searchAccessTechnology = SEARCH_ACCESS_TECHNOLOGY;
   WioNetwork.config.ltemBand = LTEM_BAND;  //LTE-Mバンドの選択
   WioNetwork.config.apn = APN;
 
   WioNetwork.begin();
-  if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) abort();
-  digitalWrite(PIN_VGROVE_ENABLE, LOW);  //Grove電源ON
-
-  Serial1.begin(9600);  // UARTの通信ボーレート設定
+  if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) NVIC_SystemReset();
+  //digitalWrite(PIN_VGROVE_ENABLE, LOW);  //Grove電源ON
+  digitalWrite(LED_BUILTIN, LOW);  //LED OFF
 }
 
 
@@ -216,17 +238,12 @@ void loop() {
   sensor.start();  // 土壌センサの測定開始設定
   JsonDoc.clear();
 
-  // **1時間ごとに RTC の時刻を取得**
-  if (millis() - lastRtcUpdate >= RTC_UPDATE_INTERVAL) {
-    lastRtcUpdate = millis();  // 更新時間を記録
-    WioCellular.getClock(&currentTime, &diff);
-    Serial.println("RTC updated");
-  }
-
   sensor.read(TEMP, EC_BULK, VWC_ROCK, VWC, VWC_COCO, EC_PORE);
+  BATT = analogRead(A5) * 0.6f / (1.0f / 6) * (107.5 / 97.5) / 1023;
   time_t rawTime = currentTime + (diff * 60 * 60) + ((millis() - lastRtcUpdate) / 1000);  //現在時刻に時差と前回更新からの経過時間を追加
-
-  jsonModule.createJson(JsonDoc, TEMP, EC_BULK, VWC_ROCK, VWC, VWC_COCO, EC_PORE, rawTime);
+  VSYS = getVoltage();
+  CHARGE = getChargeState();
+  jsonModule.createJson(JsonDoc, TEMP, EC_BULK, VWC_ROCK, VWC, VWC_COCO, EC_PORE, BATT, VSYS, CHARGE, rawTime);
 
   send(JsonDoc);  //JSONを送信
 
@@ -237,8 +254,15 @@ void loop() {
   digitalWrite(LED_BUILTIN, LOW);
   digitalWrite(PIN_VGROVE_ENABLE, HIGH);  //Grove電源OFF
   WioCellular.doWorkUntil(INTERVAL - (millis() - time_before_processing));
-}
 
+  //前回更新から12時間以上経っていたら0時台に時刻修正////////////
+  int jstHour = (rawTime % 86400) / 3600;                                     // JSTの現在時刻（時のみ抽出）
+  if (jstHour == 0 && (millis() - lastRtcUpdate) >= (1000 * 60 * 60 * 12)) {  // 条件A: JSTで0時台 かつ 条件B: 最終更新から12時間以上
+    lastRtcUpdate = millis();
+    WioCellular.getClock(&currentTime, &diff);
+    Serial.println("RTC updated in JST midnight.");
+  }
+}
 
 //send:データの外部送信/////////////////
 static bool send(const JsonDocument &doc) {  //測定データの送信およびシリアル出力関数
@@ -307,14 +331,17 @@ void checkAndReconnectNetwork() {  //ネットワーク再探索処理
   }
 }
 
-//abortHandler:LEDの点滅関数/////////////////////
-static void abortHandler(int sig) {  //LEDの点滅
-  while (true) {
-    ledOn(LED_BUILTIN);
-    delay(100);
-    ledOff(LED_BUILTIN);
-    delay(100);
-  }
+//getVoltage:システム電圧検出/////////////////////
+float getVoltage() {
+  WioCellular.getBatteryChargeState(&bcs, &bcl, &bv);
+  VSYS = float(bv) / 1000;
+  return VSYS;
+}
+
+//ChargeState:バッテリー残量検出/////////////////////
+int getChargeState() {
+  WioCellular.getBatteryChargeState(&bcs, &bcl, &bv);
+  return bcl;
 }
 
 //テンプレート/////////////////////
