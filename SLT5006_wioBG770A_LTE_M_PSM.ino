@@ -1,0 +1,393 @@
+/*
+ * SLT5006_BG770A_LTE-M.ino
+ * Grove温湿度計SHT31の値をSORACOM Unified endpointへ5分間隔で送信
+ * 電源電圧監視と低電圧時の待機
+ * 毎日0時過ぎに1回RTCの時刻修正
+ * バッテリー残量取得
+ * ※20250730エラー時システムリセット
+ */
+///////////////////////////////////////////////////////////////////////////////
+// Libraries:
+//   http://librarymanager#ArduinoJson 7.0.4
+//   http://librarymanager#GroveDriverPack 1.12.0
+///////////////////////////////////////////////////////////////////////////////
+
+#include <Adafruit_TinyUSB.h>  //USBシリアル
+#include <climits>             //整数型データの制限値定義
+#include <csignal>             //シグナル処理
+//#include <Wire.h> //One Wireの使用
+#include <WioCellular.h>      //セルラー回線の利用
+#include <ArduinoJson.h>      //JSON取り扱い
+#include <ctime>              //strftimeの使用
+#include <map>                //HTTPレスポンスの構造体に利用
+#include <GroveDriverPack.h>  //Groveセンサの利用
+
+static GroveBoard Board;
+static JsonDocument JsonDoc;
+
+char SoilData[100];                                             //土壌センサ用データ取得配列
+int SoilDataLength;                                             //土壌センサ用データ長
+float TEMP, EC_BULK, VWC_ROCK, VWC, VWC_COCO, EC_PORE = { 0 };  //土壌センサ測定値変数
+float BATT, VSYS;                                               //電圧
+int bcs, bcl, bv = { 0 };                                       //システム電圧
+#define VOLTAGE_THRESHOLD 2.9                                   // 電源電圧が復帰したと判断するしきい値[V]
+int CHARGE;                                                     //光センサ出力値
+
+//タイムスタンプ関連宣言
+time_t currentTime;                   //現在時刻のUNIX時間(秒で取得)
+unsigned long lastRtcUpdate = 0;      // 最後に RTC を更新した時間
+char iso8601[25];                     //ISO8601タイムスタンプ用
+int diff;                             //UTCとの時差格納用
+static time_t lastRtcUpdateUnix = 0;  // 前回RTC更新したUNIX時間
+
+//セルラー通信設定
+#define SEARCH_ACCESS_TECHNOLOGY (WioCellularNetwork::SearchAccessTechnology::LTEM)  // https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
+#define LTEM_BAND (WioCellularNetwork::ALL_LTEM_BAND)                                // すべてのネットワークを探索 https://seeedjp.github.io/Wiki/Wio_BG770A/kb/kb4.html
+static const char APN[] = "soracom.io";
+static const char HOST[] = "uni.soracom.io";  //Unified endpoint
+static constexpr int PORT = 23080;
+
+//各種時間設定
+static constexpr int INTERVAL = 1000 * 60 * 5;                 // 測定インターバル[ms]
+const unsigned long RTC_UPDATE_INTERVAL = 1000 * 60 * 60 * 6;  // RTC更新インターバル(6時間)[ms]
+static constexpr int POWER_ON_TIMEOUT = 1000 * 20;             // 電源タイムアプト時間[ms]
+static constexpr int NETWORK_TIMEOUT = 1000 * 60 * 5;          // ネットワークタイムアウト時間[ms]
+static constexpr int RECEIVE_TIMEOUT = 1000 * 10;              // 受信タイムアウト時間[ms]
+static constexpr int PSM_PERIOD = 60 * 10;                     // PSM周期時間[s]
+static constexpr int PSM_ACTIVE = 2;                           // PSMアクティブ時間[s]
+static constexpr int PSM_POWER_DOWN_TIMEOUT = 1000 * 60;       // セルラーモジュール電源OFFタイムアウト時間[ms]
+
+
+//HTTPレスポンスの構造体
+struct HttpResponse {
+  int statusCode;
+  std::map<std::string, std::string> headers;
+  std::string body;
+};
+
+// 土壌センサー用モジュール ※センサ種類に応じて要変更
+class SensorModule {
+public:
+  void start() {
+    ///土壌センサSLT5006への測定開始////////////////
+    uint8_t txData[] = { 0x02, 0x07, 0x01, 0x01, 0x0D, 0x70 };  //SLT5006用測定開始コマンド
+    Serial1.write(txData, sizeof(txData));
+    delay(50);
+    if (!Serial1.available()) {                // 受信データがあるか？
+      Serial.println("Sensor is not found.");  //データが無いとき
+    } else {
+      receiveData1();  //測定開始信号のレスポンス確認
+    }
+  }
+  bool read(float &TEMP, float &EC_BULK, float &VWC_ROCK, float &VWC, float &VWC_COCO, float &EC_PORE) {
+    int flag = 0;
+    int retry = 0;
+    while (flag == 0 && retry < 10) {
+      uint8_t txData2[] = { 0x01, 0x08, 0x01, 0x00, 0xE6 };
+      Serial1.write(txData2, sizeof(txData2));
+      delay(50);
+      receiveData2(&flag);
+      delay(500);
+      retry++;
+    }
+    if (flag == 0) {
+    Serial.println("Sensor read timeout");
+    return false; //センサ応答無限ループ回避 
+    }
+
+    uint8_t txData3[] = { 0x01, 0x13, 0x10, 0xFC, 0x2C };  //SLT5006用測定データ読出しコマンド
+    Serial1.write(txData3, sizeof(txData3));
+    delay(50);
+    uint8_t val[21] = { 1 };
+    receiveData3(val);
+
+    TEMP = 0;
+    EC_BULK = 0;
+    VWC_ROCK = 0;
+    VWC = 0;
+    VWC_COCO = 0;
+    EC_PORE = 0;
+    TEMP = (val[3] + val[4] * 256) * 0.0625;
+    EC_BULK = (val[5] + val[6] * 256) * 0.001;
+    VWC_ROCK = (val[7] + val[8] * 256) * 0.1;
+    VWC = (val[9] + val[10] * 256) * 0.1;
+    VWC_COCO = (val[11] + val[12] * 256) * 0.1;
+    EC_PORE = (val[15] + val[16] * 256) * 0.001;
+
+    return true;
+  }
+
+private:
+  void receiveData1() {
+    if (Serial1.available() > 0) {
+      uint8_t receivedData[6];                                                // 受信データ用バッファ
+      size_t length = Serial1.readBytes(receivedData, sizeof(receivedData));  // データを受信
+      Serial.print("Received1: ");
+      for (size_t i = 0; i < length; i++) {
+        Serial.print(receivedData[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+    }
+  }
+
+  void receiveData2(int *flag) {
+    if (Serial1.available() > 0) {
+      uint8_t receivedData[6];
+      size_t length = Serial1.readBytes(receivedData, sizeof(receivedData));
+      Serial.print("Received2: ");
+      for (size_t i = 0; i < length; i++) {
+        Serial.print(receivedData[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+      if (receivedData[3] != 0) {
+        *flag = 1;
+      }
+    }
+  }
+
+  void receiveData3(uint8_t *val) {
+    if (Serial1.available() > 0) {
+      uint8_t receivedData[21];
+      size_t length = Serial1.readBytes(receivedData, sizeof(receivedData));
+      Serial.print("Received3: ");
+      for (size_t i = 0; i < length; i++) {
+        val[i] = receivedData[i];
+        Serial.print(receivedData[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+    }
+  }
+};
+
+// JSON生成用モジュール ※出力項目に応じて要変更
+class JsonModule {
+public:
+  void createJson(JsonDocument &doc, float TEMP, float EC_BULK, float VWC_ROCK, float VWC, float VWC_COCO, float EC_PORE, float BATT, float VSYS, int CHRAGE, time_t rawTime) {
+    struct tm *jstTime = gmtime(&rawTime);  //UNIX時間(time_t型)を日本時間のtm構造体に変換
+    char iso8601[25];                       //ISO8601形式の配列
+    strftime(iso8601, sizeof(iso8601), "%Y-%m-%dT%H:%M:%S", jstTime);
+
+    doc["sample_time"] = iso8601;
+    doc["TEMP"] = formatFloat(TEMP,1);
+    doc["EC_BULK"] = formatFloat(EC_BULK,1);
+    doc["VWC_ROCK"] = formatFloat(VWC_ROCK,1);
+    doc["VWC"] = formatFloat(VWC,1);
+    doc["VWC_COCO"] = formatFloat(VWC_COCO,1);
+    doc["EC_PORE"] = formatFloat(EC_PORE,1);
+    doc["BATT"] = formatFloat(BATT,1);      //バッテリー電圧
+    doc["VSYS"] = formatFloat(VSYS,1);      //システム電圧
+    doc["CHARGE"] = CHARGE;  //バッテリー残量
+  }
+private:
+  String formatFloat(float value, uint8_t digits) {
+    return String(value, digits);  // 小数点以下桁数で文字列に変換
+  }
+
+};
+
+//クラスのオブジェクト生成
+SensorModule sensor;  // センサーモジュールを作成
+JsonModule jsonModule;
+
+void setup() {
+  Serial.begin(115200);  //シリアルポートの設定
+  {
+    const auto start = millis();
+    while (!Serial && millis() - start < 5000) {
+      delay(2);
+    }
+  }
+
+  USBDevice.detach();  // *********デバッグ時コメントアウト*********USB CDC シリアル通信を切断
+
+  Serial.println();
+  Serial.println("Startup");        //セルラー通信の開始
+  digitalWrite(LED_BUILTIN, HIGH);  //LED ON
+
+  WioCellular.begin();
+  if (WioCellular.powerOn(-1) != WioCellularResult::Ok) NVIC_SystemReset();
+  //if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) abort();
+
+  digitalWrite(PIN_VGROVE_ENABLE, LOW);  //Grove電源ON
+  Serial1.begin(9600);                   // UARTの通信ボーレート設定
+  delay(500);
+  digitalWrite(PIN_VGROVE_ENABLE, HIGH);  //Grove電源OFF
+
+  WioNetwork.config.searchAccessTechnology = SEARCH_ACCESS_TECHNOLOGY;
+  WioNetwork.config.ltemBand = LTEM_BAND;  //LTE-Mバンドの選択
+  WioNetwork.config.apn = APN;
+
+  WioNetwork.begin();
+  if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) NVIC_SystemReset();
+
+  digitalWrite(LED_BUILTIN, LOW);  //LED OFF
+}
+
+//メインのループ処理/////////////
+void loop() {
+  int time_before_processing = millis();  //処理時間補正用の処理前時刻を格納
+  Serial.println("time_before_processing set.");
+
+  if (WioCellular.powerOn(POWER_ON_TIMEOUT) != WioCellularResult::Ok) NVIC_SystemReset();  // セルラーモジュールの電源ON
+  WioNetwork.begin();
+  Serial.println("WioNetwork begin");
+  
+  // PSMのリセット
+  if (WioCellular.setPsmEnteringIndicationUrc(true) != WioCellularResult::Ok) NVIC_SystemReset();//URC通知によりウェイクアップ
+  if (WioCellular.setPsm(0, PSM_PERIOD, PSM_ACTIVE) != WioCellularResult::Ok) NVIC_SystemReset();//PSMを無効化
+
+  checkAndReconnectNetwork();  // ネットワークの接続状態を監視 PSM時は要らない？
+
+  //最初のループで時刻取得
+  if (currentTime == 0) {
+    lastRtcUpdate = millis();                   // 更新時間を記録
+    WioCellular.getClock(&currentTime, &diff);  //currentTimeにRTC時刻を格納
+    Serial.println("RTC updated in first loop");
+  }
+
+  digitalWrite(PIN_VGROVE_ENABLE, LOW);  //Grove電源ON
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(500);
+  sensor.start();  // 土壌センサの測定開始設定
+  JsonDoc.clear();
+
+  sensor.read(TEMP, EC_BULK, VWC_ROCK, VWC, VWC_COCO, EC_PORE);
+  BATT = analogRead(A5) * 0.6f / (1.0f / 6) * (107.5 / 97.5) / 1023;
+  time_t rawTime = currentTime + (diff * 60 * 60) + ((millis() - lastRtcUpdate) / 1000);  //現在時刻に時差と前回更新からの経過時間を追加
+  VSYS = getVoltage();
+  CHARGE = getChargeState();
+  jsonModule.createJson(JsonDoc, TEMP, EC_BULK, VWC_ROCK, VWC, VWC_COCO, EC_PORE, BATT, VSYS, CHARGE, rawTime);
+
+  send(JsonDoc);  //JSONを送信
+
+  //測定の終了//////////////////////////////
+  digitalWrite(LED_BUILTIN, LOW);
+  digitalWrite(PIN_VGROVE_ENABLE, HIGH);  //Grove電源OFF
+
+  Serial.println();
+
+  //前回更新から12時間以上経っていたら0時台に時刻修正////////////
+  int jstHour = (rawTime % 86400) / 3600;                                     // JSTの現在時刻（時のみ抽出）
+  if (jstHour == 0 && (millis() - lastRtcUpdate) >= (1000 * 60 * 60 * 12)) {  // 条件A: JSTで0時台 かつ 条件B: 最終更新から12時間以上
+    lastRtcUpdate = millis();
+    WioCellular.getClock(&currentTime, &diff);
+    Serial.println("RTC updated in JST midnight.");
+  }
+  
+  // セルラーモジュールの電源OFF
+  bool powerDown = false;
+  if (WioNetwork.canCommunicate()) {
+    // PSMのセット
+    if (WioCellular.setPsm(1, PSM_PERIOD, PSM_ACTIVE) != WioCellularResult::Ok) NVIC_SystemReset();
+    const auto PSM_start = millis();
+    while (millis() - PSM_start < PSM_POWER_DOWN_TIMEOUT) {
+      WioCellular.doWork(10);  // Spin
+      if (!WioCellular.getInterface().isActive()) {
+        powerDown = true;
+        break;
+      }
+    }
+  }
+  if (!powerDown) {
+    WioNetwork.end();
+    if (WioCellular.powerOff() != WioCellularResult::Ok) NVIC_SystemReset();
+  } else {
+    WioNetwork.end(false);
+  }
+
+  auto wait = (long)INTERVAL - (millis() - time_before_processing);
+  if (wait < 0) wait = 0;
+  WioCellular.doWorkUntil(wait);
+}
+
+//send:データの外部送信/////////////////
+static bool send(const JsonDocument &doc) {  //測定データの送信およびシリアル出力関数
+  Serial.println("### Sending");
+
+  Serial.print("Connecting ");
+  Serial.print(HOST);
+  Serial.print(":");
+  Serial.println(PORT);
+
+  {
+    WioCellularTcpClient2<WioCellularModule> client{ WioCellular };
+    if (!client.open(WioNetwork.config.pdpContextId, HOST, PORT)) {
+      Serial.printf("ERROR: Failed to open %s\n", WioCellularResultToString(client.getLastResult()));
+      return false;
+    }
+
+    if (!client.waitforConnect()) {
+      Serial.printf("ERROR: Failed to connect %s\n", WioCellularResultToString(client.getLastResult()));
+      return false;
+    }
+
+    Serial.print("Sending ");
+    std::string str;
+    serializeJson(doc, str);
+    printData(Serial, str.data(), str.size());
+    Serial.println();
+
+    if (!client.send(str.data(), str.size())) {
+      Serial.printf("ERROR: Failed to send socket %s\n", WioCellularResultToString(client.getLastResult()));
+      return false;
+    }
+
+    Serial.println("### Receiving ###");
+    static uint8_t recvData[WioCellular.RECEIVE_SOCKET_SIZE_MAX];
+    size_t recvSize;
+    if (!client.receive(recvData, sizeof(recvData), &recvSize, RECEIVE_TIMEOUT)) {
+      Serial.printf("ERROR: Failed to receive socket %s\n", WioCellularResultToString(client.getLastResult()));
+      return false;
+    }
+
+    printData(Serial, recvData, recvSize);
+    Serial.println();
+  }
+
+  Serial.println("### Completed ###");
+
+  return true;
+}
+
+void checkAndReconnectNetwork() {  //ネットワーク再探索処理
+  if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) {
+    Serial.println("LTE-M is disconnect. reconnecting... ");
+
+    // ネットワークを一旦停止
+    WioNetwork.end();
+    delay(2000);  // 少し待機
+
+    // 再探索を開始
+    WioNetwork.begin();
+    if (!WioNetwork.waitUntilCommunicationAvailable(NETWORK_TIMEOUT)) {
+      Serial.println("LTE-M reconnect failed");
+    } else {
+      Serial.println("LTE-M recconect succeeded.");
+    }
+  }
+}
+
+//getVoltage:システム電圧検出/////////////////////
+float getVoltage() {
+  WioCellular.getBatteryChargeState(&bcs, &bcl, &bv);
+  VSYS = float(bv) / 1000;
+  return VSYS;
+}
+
+//ChargeState:バッテリー残量検出/////////////////////
+int getChargeState() {
+  WioCellular.getBatteryChargeState(&bcs, &bcl, &bv);
+  return bcl;
+}
+
+//テンプレート/////////////////////
+template<typename T>
+void printData(T &stream, const void *data, size_t size) {
+  auto p = static_cast<const char *>(data);
+
+  for (; size > 0; --size, ++p)
+    stream.write(0x20 <= *p && *p <= 0x7f ? *p : '.');
+}
